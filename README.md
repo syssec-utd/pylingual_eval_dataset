@@ -128,19 +128,36 @@ File success: 7089/10000 70.89%
 ```
 File success reports the number of files for which every equivalence check succeeded divided by the total number of files attempted.
 
-## Current Evaluation
+## V1 Evaluation
 
 [Pylingual v0.0.1](https://github.com/syssec-utd/pylingual/releases/tag/v0.0.1)
 
-| Version | Decompilation Rate | 
-|---------|--------------|
-| 3.6     |    85.36%    |
-|3.7      | 83.84%       |
-| 3.8     | 82.53%       |
-| 3.9     |   84.82%     |
-| 3.10    | 84.61%       |
-| 3.11    | 86.7 %       |
-| 3.12    | 84.36%       |
-| 3.13    | 70.96%       |
-| 3.14    | 70.81%       |
-| 3.15    | 70.89%       |
+| Version | File Count  |  Decompilation Rate | 
+|---------|-------------|---------------------|
+| 3.6     | 4780        | 85.36%              |
+|3.7      | 4949        | 83.84%              |
+| 3.8     | 4987        | 82.53%              |
+| 3.9     | 4987        | 84.82%              |
+| 3.10    | 4991        | 84.61%              |
+| 3.11    | 4991        | 86.70%              |
+| 3.12    | 4962        | 84.36%              |
+| 3.13    | 4962        | 70.96%              |
+| 3.14    | 4991        | 70.81%              |
+| 3.15    | 4991        | 70.89%              |
+
+## V2 Evaluations
+
+[Pylingual v0.0.1](https://github.com/syssec-utd/pylingual/tree/29aa2d2b53009e989961cafa9f040c0654b34867)
+
+| Version | File Count | Decompilation Rate | 
+|---------|----------- |--------------------|
+| 3.6     | 1106       |15.55%              |
+| 3.7     | 1198       | 13.36%             |
+| 3.8     | 1284       | 9.97%              |
+| 3.9     | 1201       | 16.82%             |
+| 3.10    | 1261       | 20.22%             |
+| 3.11    | 1335       | 13.48%             |
+| 3.12    | 1362       | 15.42%             |
+| 3.13    | 2788       | 40.17%             |
+| 3.14    | 1915       | 1.04%              | 
+| 3.15    | 2078       | 10.39%             |
