@@ -125,7 +125,7 @@ def detect_gpus() -> list[int]:
 @click.option("-g", "--gpus", default=None, type=str, help="Comma-separated GPU ids to use, e.g. 0,1,2 (default: all detected GPUs)")
 @click.option("-w", "--workers-per-gpu", default=1, type=click.IntRange(min=1), help="Worker processes per GPU (default: 1)")
 @click.option("-r", "--redis-host", default=os.environ.get("PYLINGUAL_REDIS_HOST", ""), type=str, help="Host of a redis translation cache, e.g. 127.0.0.1. Omit to disable caching (default: $PYLINGUAL_REDIS_HOST)")
-def main(out_dir, pylingual_version, pyc_list, version, gpus, workers_per_gpu):
+def main(out_dir, pylingual_version, pyc_list, version, gpus, workers_per_gpu, redis_host):
     gpu_ids = [int(g) for g in gpus.split(",")] if gpus else detect_gpus()
     redis_host = redis_host or None
     if not gpu_ids:
