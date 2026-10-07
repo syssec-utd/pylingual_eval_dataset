@@ -1,77 +1,175 @@
-import pathlib
-import tqdm
-import click
 import csv
-
+import multiprocessing as mp
+import os
+import pathlib
+import signal
+import subprocess
 from datetime import datetime
 
-import signal
+import click
+import tqdm
 
-from pylingual.utils.generate_bytecode import CompileError
-from pylingual.decompiler import decompile
+from pylingual.utils.version import PythonVersion
 
-@click.command(help= "Evaluation script for pylingual")
-@click.argument("pyc_list")
-@click.argument("out_dir")
-def main(pyc_list, out_dir):
+TIMEOUT_SECONDS = 300 # 5-minute timeout for decompiling one file
+FIELDNAMES = ["pyc_file", "py_file", "identifier", "success", "category", "notes"]
+REDIS_PORT = 6379  # matches docker-compose.yml
+DATASET_ROOT = pathlib.Path(__file__).resolve().parent
+
+# worker functions
+
+def _timeout_handler(signum, frame):
+    raise TimeoutError()
+
+
+def _init_worker(gpu_queue, redis_host):
+    """Runs once per worker process to claim a GPU"""
+    gpu = gpu_queue.get()
+    if gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    # stored on the module so _process_file can reach it after the spawn
+    _process_file.redis_host = redis_host
+
+
+def _process_file(task):
+    """Decompile one file. Returns plain picklable data for the parent to write."""
+    # Imported here so CUDA_VISIBLE_DEVICES is set before loading torch
+    from pylingual.decompiler import decompile
+    from pylingual.utils.generate_bytecode import CompileError
+
+    pyc_file, target_out_dir = task
+    signal.alarm(TIMEOUT_SECONDS)
+    try:
+        # redis_cache_server_ip enables the shared translation cache (None disables it)
+        py_file = decompile(
+            pyc_file,
+            target_out_dir,
+            redis_cache_server_ip=getattr(_process_file, "redis_host", None),
+            redis_port=REDIS_PORT,
+        )
+    except Exception as err:
+        return pyc_file, repr(err), None
+    finally:
+        signal.alarm(0)
+
+    results = [
+        (r.success, str(r) if isinstance(r, CompileError) else r.message)
+        for r in py_file.equivalence_results
+    ]
+    return pyc_file, None, results
+
+
+# main evaluation function
+def evaluate(pool, pyc_list: pathlib.Path, out_dir: pathlib.Path, *, base_dir: pathlib.Path | None = None):
     start_time = datetime.now()
-    
-    def timeout_handler(signum, frame):
-        raise TimeoutError()
-        
-    signal.signal(signal.SIGALRM, timeout_handler)
 
-    pyc_list = pathlib.Path(pyc_list)
-    out_dir = pathlib.Path(out_dir) / f"pylingual-{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-    
-    pyc_files = [pathlib.Path(pyc_path_line.strip()) for pyc_path_line in pyc_list.read_text().splitlines()]
+    out_dir = out_dir / f"pylingual-{start_time:%Y-%m-%d_%H-%M-%S}"
+    results_dir = out_dir / "decompilation_results"
+    results_dir.mkdir(parents=True, exist_ok=True)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    evaluation_results_file = out_dir / 'evaluation_results.csv'
-    evaluation_results_stream = evaluation_results_file.open('w', newline='')
-    evaluation_writer = csv.DictWriter(evaluation_results_stream, fieldnames=['pyc_file', 'py_file', 'identifier', 'success', 'category', 'notes'])
-    evaluation_writer.writeheader()
+    pyc_files = [pathlib.Path(line.strip()) for line in pyc_list.read_text().splitlines() if line.strip()]
+    # Bundled manifests are relative to the dataset root; custom lists keep cwd semantics.
+    if base_dir is not None:
+        pyc_files = [p if p.is_absolute() else base_dir / p for p in pyc_files]
+    tasks = [(p, results_dir / f"{p.parent.name}.py") for p in pyc_files]
 
-    # decompile all the pyc files
-    total_files_succeeded = 0
-    total_files_attempted = 0 
-    for pyc_file in (evaluation_progress := tqdm.tqdm(pyc_files)):
-        decompiler_results_dir = out_dir / 'decompilation_results'
-        decompiler_results_dir.mkdir(parents=True, exist_ok=True)
-        target_out_dir =  decompiler_results_dir / (str(pyc_file.parent.name) + ".py") 
-        identifier = str(pyc_file).split("/")[-2]
-        # update progress bar
-        if total_files_attempted > 0:
-            evaluation_progress.set_postfix({
-                'file_success': f'{total_files_succeeded}/{total_files_attempted} ({total_files_succeeded / total_files_attempted:.2%})', 
-                })
+    attempted = succeeded = 0
 
-        total_files_attempted += 1
-        
-        # decompile the file
-        try:
-            signal.alarm(300) # 5-minute timeout for decompiling one file
-            py_file = decompile(pyc_file, target_out_dir)
-            signal.alarm(0) # success; disable timer
-        except Exception as err:
-            signal.alarm(0) 
-            evaluation_writer.writerow({'pyc_file': pyc_file, 'py_file': '', 'identifier': 'FILE', 'success': False, 'category': 'DECOMPILER ERROR', 'notes': repr(err)})
-            continue
+    with (out_dir / "evaluation_results.csv").open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
 
-        if all([result.success for result in py_file.equivalence_results]):
-            evaluation_writer.writerow({'pyc_file': pyc_file, 'py_file': pyc_file.parent.name, 'identifier': 'FILE', 'success': True, 'category': 'Equal', 'notes': ''})
-            total_files_succeeded += 1
+        # decompile pyc files
+        progress = tqdm.tqdm(total=len(tasks))
+        for pyc_file, error, results in pool.imap_unordered(_process_file, tasks):
+            identifier = pyc_file.parent.name
+            row = {"pyc_file": pyc_file, "py_file": identifier, "identifier": "FILE"}
+            attempted += 1
+
+            if error is not None:
+                writer.writerow({**row, "py_file": "", "success": False, "category": "DECOMPILER ERROR", "notes": error})
+            else:
+                ok = all(success for success, _ in results)
+                succeeded += ok
+                writer.writerow({**row, "success": ok, "category": "Equal" if ok else "Different", "notes": ""})
+                writer.writerows(
+                    {**row, "identifier": identifier, "success": success, "notes": notes}
+                    for success, notes in results
+                )
+
+            # update progress bar
+            f.flush()
+            progress.update(1)
+            progress.set_postfix(file_success=f"{succeeded}/{attempted} ({succeeded / attempted:.2%})")
+        progress.close()
+
+    # final stats and time
+    rate = f"{succeeded / attempted:.2%}" if attempted else "N/A"
+    (out_dir / "elapsed_time.txt").write_text(
+        f"Elapsed Time: {datetime.now() - start_time}\n"
+        f"File success: {succeeded}/{attempted} {rate}\n"
+    )
+
+
+def detect_gpus() -> list[int]:
+    """Count GPUs via nvidia-smi so the parent never initializes CUDA."""
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=True).stdout
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return []
+    return list(range(sum(1 for line in out.splitlines() if line.startswith("GPU "))))
+
+
+@click.command(help="Evaluation script for pylingual")
+@click.argument("out_dir", type=click.Path(file_okay=False, path_type=pathlib.Path))
+@click.option("-l", "--pyc-list", default=None, type=click.Path(exists=True, path_type=pathlib.Path), help="A list of file paths to evaluate on")
+@click.option("-v", "--version", default=None, type=str, help="Python version to evaluate, e.g. 3.13 (default: all versions in this dataset)")
+@click.option("-g", "--gpus", default=None, type=str, help="Comma-separated GPU ids to use, e.g. 0,1,2 (default: all detected GPUs)")
+@click.option("-w", "--workers-per-gpu", default=1, type=click.IntRange(min=1), help="Worker processes per GPU (default: 1)")
+@click.option("-r", "--redis-host", default=None, envvar="PYLINGUAL_REDIS_HOST", type=str, help="Host of a redis translation cache, e.g. 127.0.0.1. Omit to disable caching (default: $PYLINGUAL_REDIS_HOST)")
+def main(out_dir, pyc_list, version, gpus, workers_per_gpu, redis_host):
+    gpu_ids = [int(g) for g in gpus.split(",")] if gpus else detect_gpus()
+    redis_host = redis_host or None
+    if not gpu_ids:
+        click.echo("No GPUs found, running a single worker on CPU.")
+        slots = [None]
+    else:
+        slots = [g for g in gpu_ids for _ in range(workers_per_gpu)]
+    click.echo(f"Starting {len(slots)} worker(s) on GPUs: {gpu_ids or 'none'}")
+    if redis_host:
+        click.echo(f"Using redis translation cache at {redis_host}:{REDIS_PORT}")
+    else:
+        click.echo("No redis cache configured; pass --redis-host 127.0.0.1 (or set $PYLINGUAL_REDIS_HOST) to enable it")
+
+    if pyc_list:
+        lists = [(pyc_list, out_dir, None)]
+    else:
+        root_dir = DATASET_ROOT
+        if version:
+            ver = PythonVersion(version)
+            paths = [root_dir / f"{ver.major}{ver.minor}-pyc-list.txt"]
         else:
-            evaluation_writer.writerow({'pyc_file': pyc_file, 'py_file': pyc_file.parent.name, 'identifier': 'FILE', 'success': False, 'category': 'Different', 'notes': ''})
-        
-        evaluation_writer.writerows({'pyc_file': pyc_file, 'py_file': pyc_file.parent.name, 'identifier': identifier, 'success': result.success,  'notes': str(result) if isinstance(result, CompileError)  else result.message} for result in py_file.equivalence_results)
-    
-    evaluation_results_stream.close()
-    elapsed_time = datetime.now() - start_time
-    
-    with open(out_dir / 'elapsed_time.txt', 'w') as time_file:
-        time_file.write(f"Elapsed Time: {str(elapsed_time)}\n")
-        time_file.write(f"File success: {total_files_succeeded}/{total_files_attempted} {total_files_succeeded/total_files_attempted :.2%}")
+            paths = sorted(root_dir.glob("*-pyc-list.txt"))
+        if not paths:
+            raise click.ClickException(f"No dataset manifests found in {root_dir}")
+        lists = []
+        for path in paths:
+            if not path.is_file():
+                raise click.ClickException(f"Dataset manifest not found: {path.name}")
+            ver = PythonVersion(path.name.split("-")[0])
+            lists.append((path, out_dir / f"python-{ver.major}.{ver.minor}", root_dir))
+
+    # "spawn" gives each worker a clean process, so CUDA is never inherited from the parent
+    ctx = mp.get_context("spawn")
+    gpu_queue = ctx.Queue()
+    for slot in slots:
+        gpu_queue.put(slot)
+
+    with ctx.Pool(len(slots), initializer=_init_worker, initargs=(gpu_queue, redis_host)) as pool:
+        for path, target, base_dir in lists:
+            evaluate(pool, path, target, base_dir=base_dir)
+
 
 if __name__ == "__main__":
     main()
