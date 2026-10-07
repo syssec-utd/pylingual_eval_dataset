@@ -21,7 +21,7 @@ git clone --branch v1.1.0 --depth 1 https://github.com/syssec-utd/pylingual_eval
 cd pylingual-eval-v1
 ```
 
-The `v1-maintenance` branch is reserved for v1 backports. Tags are immutable release snapshots; future fixes receive new tags rather than moving an existing tag. Removing v1 from `main` does not remove it from Git history.
+The `v1-legacy` branch is retained only for posterity. Dataset v1 is frozen: no further backports or maintenance are planned. Release tags are immutable snapshots and will not be moved. Removing v1 from `main` does not remove it from Git history.
 
 ## Setup
 To run the Pylingual dataset evaluation, you will need:
